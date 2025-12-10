@@ -1,6 +1,7 @@
 import os
+import time
 import json
-import asyncio
+import tempfile
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,7 +10,6 @@ import httpx
 
 app = FastAPI()
 
-# 允许所有来源访问，方便小程序调试和线上调用
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -60,7 +60,8 @@ def find_sentence_by_id(sentence_id: str):
     return None
 
 
-# =============== 读取环境变量：DeepSeek 和 AssemblyAI ===============
+# =============== 组装 AssemblyAI 和 DeepSeek 的配置 ===============
+
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
 ASSEMBLYAI_BASE_URL = "https://api.assemblyai.com/v2"
 
@@ -69,12 +70,13 @@ DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = "deepseek-chat"
 
 
-# =============== 调用 AssemblyAI：上传音频 + 转写（西语） ===============
+# =============== 调用 AssemblyAI：上传音频 + 转写 ===============
+
 async def transcribe_with_assemblyai(audio_bytes: bytes) -> str:
     if not ASSEMBLYAI_API_KEY:
         raise RuntimeError("ASSEMBLYAI_API_KEY 未配置")
 
-    headers_upload = {
+    headers = {
         "authorization": ASSEMBLYAI_API_KEY,
         "content-type": "application/octet-stream",
     }
@@ -83,35 +85,34 @@ async def transcribe_with_assemblyai(audio_bytes: bytes) -> str:
         # 1. 上传音频
         upload_resp = await client.post(
             f"{ASSEMBLYAI_BASE_URL}/upload",
-            headers=headers_upload,
+            headers=headers,
             content=audio_bytes
         )
         upload_resp.raise_for_status()
         upload_url = upload_resp.json()["upload_url"]
 
-        # 2. 创建转写任务（指定西班牙语）
-        headers_json = {
+        # 2. 创建转写任务（指定西语）
+        transcript_headers = {
             "authorization": ASSEMBLYAI_API_KEY,
             "content-type": "application/json",
         }
         transcript_payload = {
             "audio_url": upload_url,
-            "language_code": "es",
+            "language_code": "es",  # 西班牙语
             "punctuate": True
         }
         create_resp = await client.post(
             f"{ASSEMBLYAI_BASE_URL}/transcript",
-            headers=headers_json,
+            headers=transcript_headers,
             json=transcript_payload
         )
         create_resp.raise_for_status()
         transcript_id = create_resp.json()["id"]
 
-        # 3. 轮询任务状态，直到完成或超时
+        # 3. 轮询结果，直到完成或超时
         status_url = f"{ASSEMBLYAI_BASE_URL}/transcript/{transcript_id}"
-
         for _ in range(30):  # 最多等 30 秒
-            status_resp = await client.get(status_url, headers=headers_json)
+            status_resp = await client.get(status_url, headers=transcript_headers)
             status_resp.raise_for_status()
             data = status_resp.json()
             status = data.get("status")
@@ -129,6 +130,7 @@ async def transcribe_with_assemblyai(audio_bytes: bytes) -> str:
 
 
 # =============== 调用 DeepSeek：根据标准句 + 用户句打分 ===============
+
 async def grade_with_deepseek(ref_text: str, user_text: str) -> dict:
     if not DEEPSEEK_API_KEY:
         raise RuntimeError("DEEPSEEK_API_KEY 未配置")
@@ -176,7 +178,11 @@ async def grade_with_deepseek(ref_text: str, user_text: str) -> dict:
     return result
 
 
-# =============== evaluate：整合 ASR + DeepSeek 的主接口 ===============
+# =============== /evaluate：整合 ASR + DeepSeek 的主接口 ===============
+
+import asyncio
+
+
 @app.post("/evaluate")
 async def evaluate(
     file: UploadFile = File(...),
@@ -193,14 +199,14 @@ async def evaluate(
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="Empty audio file")
 
-    # 3. 调用 AssemblyAI 转写
+    # 3. AssemblyAI 转写
     try:
         user_text = await transcribe_with_assemblyai(audio_bytes)
     except Exception as e:
         print("AssemblyAI 转写出错：", e)
         raise HTTPException(status_code=500, detail="Transcription failed")
 
-    # 4. 调用 DeepSeek 打分
+    # 4. DeepSeek 打分
     try:
         eval_result = await grade_with_deepseek(ref_text, user_text)
     except Exception as e:
