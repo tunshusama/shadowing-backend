@@ -1,27 +1,23 @@
 import os
-import tempfile
+import json
+import asyncio
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import httpx
-import whisper
 
-# --------------------
-# 1. 初始化 FastAPI
-# --------------------
 app = FastAPI()
 
+# 允许所有来源访问，方便小程序调试和线上调用
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 开发环境先放开，后面可以收紧
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --------------------
-# 2. 课程数据（和之前一样，写死一课）
-# --------------------
+# =============== 课程数据（写死一节课，和前端保持一致） ===============
 LESSON_DB = {
     "intro_001": {
         "lesson_id": "intro_001",
@@ -56,29 +52,6 @@ async def get_lesson(lesson_id: str):
     return lesson
 
 
-# --------------------
-# 3. 初始化 Whisper 模型（只加载一次）
-# --------------------
-# 模型越小越快，tiny 就够你一句两三秒的西语练习用
-print("Loading Whisper model... (tiny)")
-whisper_model = whisper.load_model("tiny")
-print("Whisper model loaded.")
-
-
-# --------------------
-# 4. DeepSeek 配置
-# --------------------
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
-DEEPSEEK_MODEL = "deepseek-chat"  # 通用聊天模型，便宜够用
-
-if not DEEPSEEK_API_KEY:
-    print("⚠️ WARNING: DEEPSEEK_API_KEY 环境变量未设置，调用评分会失败。")
-
-
-# --------------------
-# 5. 工具函数：根据 sentence_id 找到标准句
-# --------------------
 def find_sentence_by_id(sentence_id: str):
     for lesson in LESSON_DB.values():
         for s in lesson["sentences"]:
@@ -87,28 +60,77 @@ def find_sentence_by_id(sentence_id: str):
     return None
 
 
-# --------------------
-# 6. 工具函数：用 Whisper 把音频转成西语文本
-# --------------------
-def transcribe_audio_to_text(audio_bytes: bytes) -> str:
-    # 在临时文件里保存一下音频
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-        tmp.write(audio_bytes)
-        tmp_path = tmp.name
+# =============== 读取环境变量：DeepSeek 和 AssemblyAI ===============
+ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+ASSEMBLYAI_BASE_URL = "https://api.assemblyai.com/v2"
 
-    # 调用 whisper 转写
-    result = whisper_model.transcribe(tmp_path, language="es")
-    text = result.get("text", "").strip()
-    print("Whisper 转写结果：", text)
-    return text
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_MODEL = "deepseek-chat"
 
 
-# --------------------
-# 7. 工具函数：调用 DeepSeek 做评分
-# --------------------
+# =============== 调用 AssemblyAI：上传音频 + 转写（西语） ===============
+async def transcribe_with_assemblyai(audio_bytes: bytes) -> str:
+    if not ASSEMBLYAI_API_KEY:
+        raise RuntimeError("ASSEMBLYAI_API_KEY 未配置")
+
+    headers_upload = {
+        "authorization": ASSEMBLYAI_API_KEY,
+        "content-type": "application/octet-stream",
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        # 1. 上传音频
+        upload_resp = await client.post(
+            f"{ASSEMBLYAI_BASE_URL}/upload",
+            headers=headers_upload,
+            content=audio_bytes
+        )
+        upload_resp.raise_for_status()
+        upload_url = upload_resp.json()["upload_url"]
+
+        # 2. 创建转写任务（指定西班牙语）
+        headers_json = {
+            "authorization": ASSEMBLYAI_API_KEY,
+            "content-type": "application/json",
+        }
+        transcript_payload = {
+            "audio_url": upload_url,
+            "language_code": "es",
+            "punctuate": True
+        }
+        create_resp = await client.post(
+            f"{ASSEMBLYAI_BASE_URL}/transcript",
+            headers=headers_json,
+            json=transcript_payload
+        )
+        create_resp.raise_for_status()
+        transcript_id = create_resp.json()["id"]
+
+        # 3. 轮询任务状态，直到完成或超时
+        status_url = f"{ASSEMBLYAI_BASE_URL}/transcript/{transcript_id}"
+
+        for _ in range(30):  # 最多等 30 秒
+            status_resp = await client.get(status_url, headers=headers_json)
+            status_resp.raise_for_status()
+            data = status_resp.json()
+            status = data.get("status")
+            if status == "completed":
+                text = data.get("text", "").strip()
+                print("AssemblyAI 转写结果：", text)
+                return text
+            elif status == "error":
+                print("AssemblyAI 转写出错：", data.get("error"))
+                raise RuntimeError("Transcription error from AssemblyAI")
+
+            await asyncio.sleep(1)
+
+        raise RuntimeError("Transcription timeout")
+
+
+# =============== 调用 DeepSeek：根据标准句 + 用户句打分 ===============
 async def grade_with_deepseek(ref_text: str, user_text: str) -> dict:
     if not DEEPSEEK_API_KEY:
-        # 这里直接抛错，前端会收到 500
         raise RuntimeError("DEEPSEEK_API_KEY 未配置")
 
     system_prompt = (
@@ -144,22 +166,17 @@ async def grade_with_deepseek(ref_text: str, user_text: str) -> dict:
         ],
     }
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(DEEPSEEK_API_URL, headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
 
-    # DeepSeek 返回结构里，内容在 choices[0].message.content 里，是一个 JSON 字符串
     content = data["choices"][0]["message"]["content"]
-    import json
-
     result = json.loads(content)
     return result
 
 
-# --------------------
-# 8. /evaluate 接口：整合转写 + 打分
-# --------------------
+# =============== evaluate：整合 ASR + DeepSeek 的主接口 ===============
 @app.post("/evaluate")
 async def evaluate(
     file: UploadFile = File(...),
@@ -169,7 +186,6 @@ async def evaluate(
     ref_sentence = find_sentence_by_id(sentence_id)
     if not ref_sentence:
         raise HTTPException(status_code=404, detail="Sentence not found")
-
     ref_text = ref_sentence["text"]
 
     # 2. 读取音频
@@ -177,25 +193,24 @@ async def evaluate(
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="Empty audio file")
 
-    # 3. Whisper 转写
+    # 3. 调用 AssemblyAI 转写
     try:
-        user_text = transcribe_audio_to_text(audio_bytes)
+        user_text = await transcribe_with_assemblyai(audio_bytes)
     except Exception as e:
-        print("Whisper 转写出错：", e)
+        print("AssemblyAI 转写出错：", e)
         raise HTTPException(status_code=500, detail="Transcription failed")
 
-    # 4. DeepSeek 打分
+    # 4. 调用 DeepSeek 打分
     try:
         eval_result = await grade_with_deepseek(ref_text, user_text)
     except Exception as e:
         print("DeepSeek 评分出错：", e)
         raise HTTPException(status_code=500, detail="Grading failed")
 
-    # 5. 把 sentence_id 带回去
     eval_result["sentence_id"] = sentence_id
+    eval_result["user_text"] = user_text
     return eval_result
 
 
 if __name__ == "__main__":
-    # 本地调试用，Render 上可以用类似的启动命令
     uvicorn.run(app, host="0.0.0.0", port=8000)
